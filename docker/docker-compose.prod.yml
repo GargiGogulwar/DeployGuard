@@ -1,0 +1,77 @@
+# Production stack used by Ansible: pulls an immutable image from GHCR (no build on the server).
+name: deployguard-prod
+services:
+  deployguard:
+    image: ${DEPLOYGUARD_IMAGE:?DEPLOYGUARD_IMAGE must be set, e.g. ghcr.io/owner/repo:sha-<commit>}
+    container_name: deployguard-prod-app
+    environment:
+      DEPLOYGUARD_ENV: ${DEPLOYGUARD_ENV:-local}
+      DEPLOYGUARD_API_TOKEN: ${DEPLOYGUARD_API_TOKEN:-}
+    ports:
+      - "${BIND_ADDRESS:-0.0.0.0}:${APP_PORT:-8000}:8000"
+    volumes:
+      - app_data:/data
+    networks: [monitoring]
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: deployguard-prod-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ../monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "${BIND_ADDRESS:-0.0.0.0}:${PROMETHEUS_PORT:-9090}:9090"
+    depends_on:
+      deployguard:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+    networks: [monitoring]
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: deployguard-prod-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ../monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "${BIND_ADDRESS:-0.0.0.0}:${GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+    networks: [monitoring]
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+
+networks:
+  monitoring:
+    driver: bridge
+
+volumes:
+  app_data:
+  prometheus_data:
+  grafana_data:

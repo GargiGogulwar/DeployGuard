@@ -1,0 +1,145 @@
+---
+- name: Deploy DeployGuard (Docker Compose) to an Ubuntu EC2 host
+  hosts: deployguard
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    - name: Verify SSH connectivity
+      ansible.builtin.ping:
+
+    - name: Check required inputs
+      ansible.builtin.assert:
+        that:
+          - deployguard_image | length > 0
+          - deployguard_image is regex(':sha-[0-9a-f]{7,40}$')
+          - grafana_admin_password | length >= 8
+        fail_msg: >-
+          Pass an immutable image with -e deployguard_image=ghcr.io/<owner>/<repo>:sha-<commit>
+          (a ':sha-<commit>' tag, never :latest) and export GRAFANA_ADMIN_PASSWORD (min 8 chars).
+        quiet: true
+
+  tasks:
+    - name: Install Docker Engine and Compose plugin from Ubuntu repositories
+      ansible.builtin.apt:
+        name: [docker.io, docker-compose-v2, curl]
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Ensure Docker is enabled and running
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Create deployment directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ deployguard_dir }}"
+        - "{{ deployguard_dir }}/docker"
+
+    - name: Copy monitoring configuration (Prometheus, Grafana provisioning, dashboards)
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../monitoring/"
+        dest: "{{ deployguard_dir }}/monitoring/"
+        mode: preserve
+
+    - name: Copy production Compose file
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../docker/docker-compose.prod.yml"
+        dest: "{{ deployguard_dir }}/docker/docker-compose.prod.yml"
+        mode: "0644"
+
+    - name: Write environment file (secrets, root-only)
+      ansible.builtin.template:
+        src: env.j2
+        dest: "{{ deployguard_dir }}/.env"
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+
+    - name: Log in to GHCR (only when credentials are provided; needed for private packages)
+      ansible.builtin.command: docker login ghcr.io -u {{ ghcr_user }} --password-stdin
+      args:
+        stdin: "{{ ghcr_token }}"
+      when: ghcr_user | length > 0 and ghcr_token | length > 0
+      changed_when: false
+      no_log: true
+
+    - name: Pull images and start/update the stack
+      community.docker.docker_compose_v2:
+        project_src: "{{ deployguard_dir }}/docker"
+        files: [docker-compose.prod.yml]
+        env_files: ["{{ deployguard_dir }}/.env"]
+        pull: always
+        state: present
+        remove_orphans: true
+      register: compose_result
+
+    - name: Wait for the application container to report healthy
+      ansible.builtin.command: docker inspect -f '{% raw %}{{.State.Health.Status}}{% endraw %}' deployguard-prod-app
+      register: app_health
+      until: app_health.stdout == 'healthy'
+      retries: 20
+      delay: 5
+      changed_when: false
+
+    - name: Show container status
+      ansible.builtin.command: docker ps --filter name=deployguard --format 'table {% raw %}{{.Names}}\t{{.Image}}\t{{.Status}}{% endraw %}'
+      register: ps_out
+      changed_when: false
+
+    - name: Print container status
+      ansible.builtin.debug:
+        var: ps_out.stdout_lines
+
+    - name: HTTP health check - /health
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ deployguard_app_port }}/health"
+        status_code: 200
+      register: health
+      until: health.status == 200
+      retries: 10
+      delay: 3
+
+    - name: HTTP readiness check - /ready
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ deployguard_app_port }}/ready"
+        status_code: 200
+
+    - name: Confirm Prometheus is scraping DeployGuard (target health == up)
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ deployguard_prometheus_port }}/api/v1/targets"
+        return_content: true
+      register: targets
+      until: >-
+        targets.json is defined and
+        (targets.json.data.activeTargets
+          | selectattr('labels.job', 'equalto', 'deployguard')
+          | map(attribute='health') | list) == ['up']
+      retries: 12
+      delay: 5
+
+    - name: Record the deployment in DeployGuard (source=ci-cd) when an API token is configured
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ deployguard_app_port }}/api/deployments"
+        method: POST
+        headers:
+          X-API-Token: "{{ deployguard_api_token }}"
+        body_format: json
+        body:
+          version: "{{ deployguard_image.split(':')[-1] | regex_replace('^sha-', '') }}"
+          image_tag: "{{ deployguard_image.split('/', 1)[-1] }}"
+          commit_sha: "{{ deployguard_image.split(':')[-1] | regex_replace('^sha-', '') }}"
+          environment: "{{ deployguard_env }}"
+          status: success
+          source: ci-cd
+          note: "Deployed by Ansible; /health, /ready and Prometheus target verified."
+        status_code: 201
+      when: deployguard_api_token | length > 0
+      no_log: true

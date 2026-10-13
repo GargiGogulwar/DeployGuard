@@ -1,0 +1,236 @@
+name: DeployGuard CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege by default; jobs that need more declare it themselves.
+permissions:
+  contents: read
+
+concurrency:
+  group: deployguard-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHON_VERSION: "3.12"   # tested version; see docs/tool-selection.md for the 3.14 note
+
+jobs:
+  # ---------- Stage 1 + 2: Source and Build ----------
+  build:
+    name: "Stage 1-2: Source and Build"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+      - name: Validate dependency set and byte-compile sources
+        run: |
+          pip check
+          python -m compileall -q app tests
+      - name: Validate application imports and configuration
+        run: |
+          DEPLOYGUARD_DB_PATH=/tmp/build-check.db python -c "from app.main import app; from app.config import get_settings; s = get_settings(); print('import OK:', s.app_name, s.version); print('routes:', sorted({r.path for r in app.routes}))"
+
+  # ---------- Stage 3: Test ----------
+  test:
+    name: "Stage 3: Test (pytest)"
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - name: Run pytest (any failure fails the workflow)
+        run: python -m pytest --cov=app --cov-report=term-missing
+
+  # ---------- Infrastructure code validation (runs in parallel with tests) ----------
+  iac-validate:
+    name: "IaC and config validation"
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate docker-compose files and Prometheus config
+        run: |
+          cp .env.example .env
+          docker compose -f docker-compose.yml config -q
+          echo "DEPLOYGUARD_IMAGE=ghcr.io/example/example:sha-0000000" >> .env
+          docker compose --env-file .env -f docker/docker-compose.prod.yml config -q
+          docker run --rm --entrypoint promtool -v "$PWD/monitoring:/m:ro" prom/prometheus:v2.55.1 check rules /m/alerts.yml
+      - uses: hashicorp/setup-terraform@v3
+      - name: Terraform fmt and validate (no cloud access, no apply)
+        working-directory: terraform
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false -input=false
+          terraform validate
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Ansible syntax check
+        run: |
+          pip install ansible
+          cp ansible/inventory.ini.example ansible/inventory.ini
+          ansible-playbook -i ansible/inventory.ini ansible/playbook.yml --syntax-check
+
+  # ---------- Stage 4: Containerization ----------
+  docker:
+    name: "Stage 4: Containerize (and publish on main)"
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # used only by the publish steps, which never run for pull requests
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      tag: ${{ steps.meta.outputs.tag }}
+      published: ${{ steps.meta.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compute image name and immutable tag
+        id: meta
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "tag=sha-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_EVENT_NAME}" = "push" ] && [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: docker/setup-buildx-action@v4
+      - name: Build image (loaded locally for checks; nothing is pushed yet)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          push: false
+          tags: deployguard:ci
+          build-args: |
+            PYTHON_VERSION=${{ env.PYTHON_VERSION }}
+            GIT_SHA=${{ github.sha }}
+            IMAGE_TAG=sha-${{ github.sha }}
+            CI_TEST_STATUS=passed
+            BUILD_TIME=${{ steps.meta.outputs.build_time }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Container checks (non-root user, starts, health, readiness, metrics)
+        run: |
+          UID_IN_IMAGE=$(docker run --rm --entrypoint id deployguard:ci -u)
+          echo "container user id: ${UID_IN_IMAGE}"
+          test "${UID_IN_IMAGE}" != "0"
+          docker run -d --name dg-check -p 18000:8000 deployguard:ci
+          for i in $(seq 1 20); do
+            curl -fsS http://127.0.0.1:18000/health && break || sleep 2
+          done
+          curl -fsS http://127.0.0.1:18000/health
+          curl -fsS http://127.0.0.1:18000/ready
+          curl -fsS http://127.0.0.1:18000/metrics | grep -q deployguard_http_requests_total
+          docker logs dg-check
+          docker rm -f dg-check
+      - name: Log in to GHCR (main branch pushes only)
+        if: steps.meta.outputs.publish == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish versioned image (main branch pushes only)
+        if: steps.meta.outputs.publish == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image }}:latest
+          build-args: |
+            PYTHON_VERSION=${{ env.PYTHON_VERSION }}
+            GIT_SHA=${{ github.sha }}
+            IMAGE_TAG=sha-${{ github.sha }}
+            CI_TEST_STATUS=passed
+            BUILD_TIME=${{ steps.meta.outputs.build_time }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha
+
+  # ---------- Stage 5 + 6: Deploy (Ansible) and Monitoring verification ----------
+  deploy:
+    name: "Stage 5-6: Deploy with Ansible and verify"
+    needs: [docker, iac-validate]
+    # Opt-in only: set repository variable DEPLOY_ENABLED=true. Never runs for PRs or forks.
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      vars.DEPLOY_ENABLED == 'true' && needs.docker.outputs.published == 'true'
+    runs-on: ubuntu-latest
+    environment: production        # add required reviewers in repo Settings -> Environments
+    permissions:
+      contents: read
+      packages: read
+    env:
+      EC2_HOST: ${{ secrets.EC2_HOST }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      SG_ID: ${{ vars.EC2_SECURITY_GROUP_ID }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install Ansible and collections
+        run: |
+          pip install ansible-core
+          ansible-galaxy collection install -r ansible/requirements.yml
+      - name: Configure AWS credentials (only used to open SSH for this runner)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Temporarily allow this runner's IP on port 22
+        run: |
+          RUNNER_IP=$(curl -fsS https://checkip.amazonaws.com | tr -d '\n')
+          echo "RUNNER_IP=${RUNNER_IP}" >> "$GITHUB_ENV"
+          aws ec2 authorize-security-group-ingress --group-id "$SG_ID" \
+            --protocol tcp --port 22 --cidr "${RUNNER_IP}/32"
+      - name: Prepare SSH key, known_hosts and inventory
+        env:
+          SSH_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+        run: |
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deployguard.pem
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          printf '[deployguard]\nserver ansible_host=%s ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/deployguard.pem\n' "$EC2_HOST" > ansible/inventory.ini
+      - name: Run Ansible deployment (immutable image tag)
+        working-directory: ansible
+        env:
+          GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+          DEPLOYGUARD_API_TOKEN: ${{ secrets.DEPLOYGUARD_API_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ansible-playbook playbook.yml \
+            -e "deployguard_image=${{ needs.docker.outputs.image }}:${{ needs.docker.outputs.tag }}"
+      - name: Revoke the temporary SSH rule
+        if: always()
+        run: |
+          if [ -n "${RUNNER_IP:-}" ]; then
+            aws ec2 revoke-security-group-ingress --group-id "$SG_ID" \
+              --protocol tcp --port 22 --cidr "${RUNNER_IP}/32" || true
+          fi

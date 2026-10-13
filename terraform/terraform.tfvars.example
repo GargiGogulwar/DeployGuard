@@ -1,0 +1,8 @@
+# cp terraform.tfvars.example terraform.tfvars  (terraform.tfvars is git-ignored)
+aws_region       = "ap-south-1"
+instance_type    = "t3.small"
+key_name         = "your-existing-key-pair-name"
+ssh_allowed_cidr = "203.0.113.10/32" # replace with YOUR public IP (documentation-range placeholder)
+web_allowed_cidrs = ["203.0.113.10/32"]
+# vpc_id    = "vpc-xxxxxxxx"    # optional; omit to use the default VPC
+# subnet_id = "subnet-xxxxxxxx" # optional

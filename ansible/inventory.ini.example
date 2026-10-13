@@ -1,0 +1,4 @@
+# cp inventory.ini.example inventory.ini   (inventory.ini is git-ignored)
+[deployguard]
+# Replace with the public_ip output of Terraform and the path of YOUR private key.
+deployguard-server ansible_host=203.0.113.10 ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/your-key.pem

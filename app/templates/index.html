@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DeployGuard Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>DeployGuard</h1>
+  <p class="sub">Automated CI/CD &amp; Deployment Monitoring &middot; v{{ settings.version }} &middot; env: {{ settings.environment }}</p>
+</header>
+<main>
+  <div id="banner" class="banner" role="status" hidden></div>
+  <section class="cards" aria-label="Status overview">
+    <article class="card"><h2>Application health</h2><p id="c-health" class="big">&hellip;</p><small id="c-uptime"></small></article>
+    <article class="card"><h2>Readiness</h2><p id="c-ready" class="big">&hellip;</p><small id="c-db"></small></article>
+    <article class="card"><h2>Build</h2><p id="c-build" class="big">&hellip;</p><small id="c-sha"></small></article>
+    <article class="card"><h2>Tests (reported by CI)</h2><p id="c-tests" class="big">&hellip;</p><small>Only "passed" when injected by the pipeline</small></article>
+    <article class="card"><h2>Latest real deployment</h2><p id="c-deploy" class="big">&hellip;</p><small id="c-deploy-ts"></small></article>
+  </section>
+  <section>
+    <h2>Deployment history</h2>
+    <p class="hint"><span class="badge runtime">runtime</span> process start &middot; <span class="badge simulated">simulated</span> demo record, no real deployment &middot; <span class="badge cicd">ci-cd</span> reported by the pipeline</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Time (UTC)</th><th>Status</th><th>Source</th><th>Version</th><th>Image tag</th><th>Env</th><th>Note</th></tr></thead>
+        <tbody id="history"><tr><td colspan="7">Loading&hellip;</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+  <section>
+    <h2>Service links</h2>
+    <p><a href="/health">/health</a> &middot; <a href="/ready">/ready</a> &middot; <a href="/api/status">/api/status</a> &middot; <a href="/api/deployments">/api/deployments</a> &middot; <a href="/metrics">/metrics</a> &middot; <a href="/docs">/docs</a></p>
+  </section>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>

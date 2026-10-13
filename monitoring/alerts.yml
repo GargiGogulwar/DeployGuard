@@ -1,0 +1,23 @@
+groups:
+  - name: deployguard
+    rules:
+      - alert: DeployGuardDown
+        expr: up{job="deployguard"} == 0
+        for: 15s
+        labels: {severity: critical}
+        annotations:
+          summary: "DeployGuard target is down"
+      - alert: DeployGuardNotReady
+        expr: deployguard_service_ready == 0
+        for: 15s
+        labels: {severity: warning}
+        annotations:
+          summary: "DeployGuard readiness check is failing"
+      - alert: DeployGuardHighErrorRate
+        expr: >
+          sum(rate(deployguard_http_requests_total{status=~"5.."}[1m]))
+          / sum(rate(deployguard_http_requests_total[1m])) > 0.05
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: "More than 5% of requests are failing with 5xx"

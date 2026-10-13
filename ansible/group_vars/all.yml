@@ -1,0 +1,15 @@
+deployguard_dir: /opt/deployguard
+deployguard_app_port: 8000
+deployguard_prometheus_port: 9090
+deployguard_grafana_port: 3000
+deployguard_env: production
+
+# Provided at run time (never stored in the repo):
+#   -e deployguard_image=ghcr.io/<owner>/<repo>:sha-<full-commit-sha>
+#   env GRAFANA_ADMIN_PASSWORD (required), DEPLOYGUARD_API_TOKEN (optional)
+#   env GHCR_USER + GHCR_TOKEN (only needed if the package is private)
+deployguard_image: ""
+grafana_admin_password: "{{ lookup('ansible.builtin.env', 'GRAFANA_ADMIN_PASSWORD') }}"
+deployguard_api_token: "{{ lookup('ansible.builtin.env', 'DEPLOYGUARD_API_TOKEN') }}"
+ghcr_user: "{{ lookup('ansible.builtin.env', 'GHCR_USER') }}"
+ghcr_token: "{{ lookup('ansible.builtin.env', 'GHCR_TOKEN') }}"
